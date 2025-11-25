@@ -4,52 +4,89 @@ import json
 from mtcnn.mtcnn import MTCNN
 from tqdm import tqdm
 import numpy as np
+import math
 
 # --- Configuration ---
-# Path to your downloaded FaceForensics++ data (from Recommendation 1)
-FFPP_DATA_PATH = './ffpp_data' 
-# Path to the JSON files you just downloaded
+# Path to your downloaded FaceForensics++ data
+FFPP_DATA_PATH = '/home//DeepfakeProject/ffpp_data'  # Update if needed
+# Path to the JSON files
 SPLIT_PATH = './splits'
-# Where you want to save the processed face images
-OUTPUT_PATH = './processed_data'
-# All the manipulation methods you downloaded
+# Output path
+OUTPUT_PATH = '/home//processed_data'
+# Methods
 MANIPULATION_METHODS = ['Deepfakes', 'Face2Face', 'FaceShifter', 'FaceSwap', 'NeuralTextures']
-# The compression level you downloaded
 COMPRESSION = 'c23'
-# Number of frames to sample per video. 
-# A lower number is faster but gives less data. 30 is a good start.
 FRAME_SAMPLE_RATE = 30 
-# The final size of the face image
 IMG_SIZE = 224
 
 # Initialize the MTCNN face detector
 detector = MTCNN()
 
-def extract_faces(video_path, output_folder, video_id, frame_sample_rate):
+def align_and_crop_face(frame, detection, target_size):
     """
-    Extracts faces from a video file and saves them as images.
+    1. Calculates the angle between the eyes.
+    2. Rotates the image to make eyes horizontal.
+    3. Crops the face.
+    """
+    keypoints = detection['keypoints']
+    box = detection['box']
     
-    :param video_path: Path to the input video file.
-    :param output_folder: Folder to save the cropped face images.
-    :param video_id: The name of the video (used for file naming).
-    :param frame_sample_rate: How many frames to extract.
-    """
+    # 1. Get Eye Coordinates
+    left_eye = keypoints['left_eye']
+    right_eye = keypoints['right_eye']
+    
+    # 2. Calculate Angle
+    # dy is the difference in height, dx is the difference in width
+    dy = right_eye[1] - left_eye[1]
+    dx = right_eye[0] - left_eye[0]
+    angle = np.degrees(np.arctan2(dy, dx)) # Angle of rotation needed
+    
+    # 3. Get Center of the Face (Nose) to rotate around
+    # We use the nose or the center of the bounding box
+    face_center = (int(box[0] + box[2]/2), int(box[1] + box[3]/2))
+    
+    # 4. Create Rotation Matrix
+    # Rotate around the center, by 'angle', scale 1.0
+    M = cv2.getRotationMatrix2D(face_center, angle, 1.0)
+    
+    # 5. Rotate the entire Frame
+    # (We rotate the whole frame to ensure we don't cut off corners of the face)
+    h, w = frame.shape[:2]
+    rotated_frame = cv2.warpAffine(frame, M, (w, h))
+    
+    # 6. Crop the Face from the Rotated Frame
+    x, y, w, h = box
+    # Ensure crop is within bounds
+    x = max(0, x)
+    y = max(0, y)
+    
+    # Add a little padding (10%) to ensure we get the whole chin/forehead after rotation
+    padding_w = int(w * 0.1)
+    padding_h = int(h * 0.1)
+    
+    face_crop = rotated_frame[
+        max(0, y - padding_h) : min(rotated_frame.shape[0], y + h + padding_h),
+        max(0, x - padding_w) : min(rotated_frame.shape[1], x + w + padding_w)
+    ]
+    
+    if face_crop.size == 0:
+        return None
+
+    # 7. Resize to target size
+    return cv2.resize(face_crop, (target_size, target_size))
+
+def extract_faces(video_path, output_folder, video_id, frame_sample_rate):
     if not os.path.exists(video_path):
-        print(f"Warning: Video not found {video_path}")
+        # print(f"Warning: Video not found {video_path}") 
         return
 
     cap = cv2.VideoCapture(video_path)
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
-    # Calculate frame indices to sample
     if frame_count <= 0:
-        print(f"Warning: Could not read video {video_path}")
         return
         
     frame_indices = np.linspace(0, frame_count - 1, frame_sample_rate, dtype=int)
-    
-    frame_num = 0
-    saved_face_count = 0
     
     for idx in frame_indices:
         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
@@ -65,34 +102,24 @@ def extract_faces(video_path, output_folder, video_id, frame_sample_rate):
         detections = detector.detect_faces(frame_rgb)
         
         if detections:
-            # Get the first and most confident face
+            # Get the most confident face
             detection = detections[0]
-            x, y, w, h = detection['box']
             
-            # Ensure coordinates are valid
-            x, y = max(0, x), max(0, y)
+            # --- NEW TECHNIQUE: ALIGNMENT ---
+            # Instead of just cropping, we align then crop
+            processed_face = align_and_crop_face(frame, detection, IMG_SIZE)
             
-            # Crop the face
-            face = frame[y:y+h, x:x+w]
-            
-            if face.size == 0:
+            if processed_face is None:
                 continue
-
-            # Resize to standard size
-            resized_face = cv2.resize(face, (IMG_SIZE, IMG_SIZE))
             
             # Save the face
             output_filename = f"{video_id}_frame{idx}.png"
             output_filepath = os.path.join(output_folder, output_filename)
-            cv2.imwrite(output_filepath, resized_face)
-            saved_face_count += 1
+            cv2.imwrite(output_filepath, processed_face)
 
     cap.release()
 
 def process_split(split_name):
-    """
-    Processes a whole split (train, val, or test) based on the JSON file.
-    """
     print(f"\n--- Processing {split_name} split ---")
     
     # 1. Load the JSON split file
@@ -107,44 +134,35 @@ def process_split(split_name):
     os.makedirs(fake_output_dir, exist_ok=True)
 
     # 3. Process videos
-    # The JSON contains pairs [id1, id2], meaning id1 was used to fake id2
     for pair in tqdm(split_data, desc=f"Processing {split_name} videos"):
         id1, id2 = pair[0], pair[1]
         
-        # --- Process REAL videos ---
-        # We process both videos in the pair as real
-        
-        # Process id1
+        # Process REAL videos (id1 and id2)
         real_video_path_1 = os.path.join(FFPP_DATA_PATH, 'original_sequences', 'youtube', COMPRESSION, 'videos', f'{id1}.mp4')
         extract_faces(real_video_path_1, real_output_dir, id1, FRAME_SAMPLE_RATE)
         
-        # Process id2
         real_video_path_2 = os.path.join(FFPP_DATA_PATH, 'original_sequences', 'youtube', COMPRESSION, 'videos', f'{id2}.mp4')
         extract_faces(real_video_path_2, real_output_dir, id2, FRAME_SAMPLE_RATE)
         
-        # --- Process FAKE videos ---
-        # The fakes are named as {id1}_{id2}.mp4 or {id2}_{id1}.mp4
-        
+        # Process FAKE videos
         for method in MANIPULATION_METHODS:
-            # Fake 1: {id1}_{id2}
             fake_video_name_1 = f'{id1}_{id2}.mp4'
             fake_video_path_1 = os.path.join(FFPP_DATA_PATH, 'manipulated_sequences', method, COMPRESSION, 'videos', fake_video_name_1)
             extract_faces(fake_video_path_1, fake_output_dir, f'{method}_{id1}_{id2}', FRAME_SAMPLE_RATE)
 
-            # Fake 2: {id2}_{id1}
             fake_video_name_2 = f'{id2}_{id1}.mp4'
             fake_video_path_2 = os.path.join(FFPP_DATA_PATH, 'manipulated_sequences', method, COMPRESSION, 'videos', fake_video_name_2)
             extract_faces(fake_video_path_2, fake_output_dir, f'{method}_{id2}_{id1}', FRAME_SAMPLE_RATE)
 
 
 if __name__ == "__main__":
-    # Create the main output directory
     os.makedirs(OUTPUT_PATH, exist_ok=True)
     
-    # Process all three splits
-    # process_split('train')
+    # Note: If you already processed data, you might want to clear the folder first
+    # or just run this to overwrite.
+    
+    # process_split('train') # Uncomment if you want to re-process training data
     process_split('val')
     process_split('test')
     
-    print("\n--- Preprocessing Complete ---")
-    print(f"Data saved to: {OUTPUT_PATH}")
+    print("\n--- Preprocessing Complete with Face Alignment ---")
